@@ -5,8 +5,8 @@ from fastmcp.server.dependencies import get_http_headers
 
 # Point this at your platform
 # PLATFORM_API_BASE = os.environ.get("PLATFORM_API_BASE", "https://api.mydomain.com")
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")  # set this in your hosting environment
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+
+
 
 
 mcp = FastMCP(name="Personize", instructions="""
@@ -68,6 +68,8 @@ async def research_company_with_tavily(company_name: str, website_url: str, ctx:
     Products, Services, Team, News, Key customers, FAQ, Pricing
     Returns Tavily's JSON response.
     """
+    tavily_api_key = os.environ.get("TAVILY_API_KEY")
+    TAVILY_SEARCH_URL = "https://api.tavily.com/search"
     if not TAVILY_API_KEY:
         raise ValueError("Missing TAVILY_API_KEY environment variable on the server.")
 
