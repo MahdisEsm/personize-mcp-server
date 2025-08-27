@@ -6,7 +6,7 @@
     "transport": "http",
     "path": "/mcp/",
     "env": {
-      "TAVILY_API_KEY": "${TAVILY_API_KEY}"   // set this in the cloud UI
+      "TAVILY_API_KEY": "${TAVILY_API_KEY}"   
     }
   }
 }
