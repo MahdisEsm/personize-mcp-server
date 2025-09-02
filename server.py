@@ -2,6 +2,8 @@ import os
 import httpx
 from fastmcp import FastMCP, Context
 from fastmcp.server.dependencies import get_http_headers
+import asyncio
+from typing import Any, Dict, List, Optional
 
 # Point this at your platform
 # PLATFORM_API_BASE = os.environ.get("PLATFORM_API_BASE", "https://api.mydomain.com")
@@ -105,6 +107,113 @@ async def research_company_with_tavily(company_name: str, website_url: str, ctx:
         await ctx.info(f"Tavily search for '{company_name}' on {website_url} returned {len(data.get('results', []))} results.")
 
     return data
+
+
+
+# ---- Pinecone search tool ----
+@mcp.tool(description="Search Pinecone for best text matches within a user's namespace.")
+async def pinecone_search(UserId: str, query: str, ctx: Context | None = None) -> dict:
+    """
+    Inputs:
+      - UserId: per-user namespace (string)
+      - query: free-text query
+
+    Behavior:
+      - Connects to Pinecone using env vars
+      - Searches the given user's namespace
+      - Returns raw Pinecone response + a 'matches' array of top texts
+    """
+    # --- Read env at call time (safer for cloud reloads) ---
+    api_key = os.environ.get("PINECONE_API_KEY")
+    index_name = os.environ.get("PINECONE_INDEX_NAME")
+    index_host = os.environ.get("PINECONE_INDEX_HOST")  # optional
+
+    if not api_key:
+        raise ValueError("Missing PINECONE_API_KEY in environment.")
+    if not index_name:
+        raise ValueError("Missing PINECONE_INDEX_NAME in environment.")
+    if not UserId or not UserId.strip():
+        raise ValueError("UserId is required.")
+    if not query or not query.strip():
+        raise ValueError("query is required.")
+
+    # Import inside function so your server can start even if the dep isn't installed locally
+    try:
+        from pinecone import Pinecone
+    except Exception as e:
+        raise RuntimeError(
+            "Pinecone SDK not available. Ensure 'pinecone' is in fastmcp.json dependencies."
+        ) from e
+
+    # Build a small sync helper because Pinecone SDK is synchronous
+    def _search_sync() -> Dict[str, Any]:
+        pc = Pinecone(api_key=api_key)
+
+        # Some SDK versions accept (index_name, host=...), others just (index_name)
+        try:
+            index = pc.Index(index_name, host=index_host) if index_host else pc.Index(index_name)
+        except TypeError:
+            # Fallback if the installed SDK doesn’t accept host in the constructor
+            index = pc.Index(index_name)
+
+        ns = index.namespace(UserId.strip())
+
+        # Depending on SDK version, the method may be `search_records` (snake_case)
+        # or `searchRecords` (camelCase). Try both for compatibility.
+        search_kwargs = {
+            "query": {
+                "topK": 5,
+                "inputs": {"text": query}
+            },
+            "fields": ['text', 'Tag', 'Type', 'RecordId', 'UserId', 'TimeStamp']
+        }
+
+        if hasattr(ns, "search_records"):
+            result = ns.search_records(**search_kwargs)
+        elif hasattr(ns, "searchRecords"):
+            result = ns.searchRecords(**search_kwargs)  # type: ignore[attr-defined]
+        else:
+            raise RuntimeError(
+                "Pinecone namespace object has no search method. "
+                "Upgrade the Pinecone SDK (try 'pinecone>=5')."
+            )
+
+        return result
+
+    try:
+        result = await asyncio.to_thread(_search_sync)
+    except Exception as e:
+        # Surface a helpful error to the model/user
+        return {
+            "success": False,
+            "error": "pinecone_search_failed",
+            "message": str(e),
+        }
+
+    # ---- Normalize matches for convenience (best-effort; shapes vary by SDK) ----
+    matches: List[str] = []
+    try:
+        # Common shape seen in the JS example: result.result.hits[*].fields.text
+        hits = (
+            result.get("result", {}).get("hits", [])
+            if isinstance(result, dict)
+            else getattr(getattr(result, "result", {}), "hits", [])
+        )
+        for h in hits:
+            fields = h.get("fields", {}) if isinstance(h, dict) else getattr(h, "fields", {})
+            txt = fields.get("text")
+            if isinstance(txt, str):
+                matches.append(txt)
+    except Exception:
+        # Ignore shape issues silently; raw result is still returned
+        pass
+
+    return {
+        "success": True,
+        "matches": matches,   # convenient concatenation candidate for downstream use
+        "raw": result         # full Pinecone response for debugging / metadata
+    }
+
 
 
 
