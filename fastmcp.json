@@ -1,7 +1,13 @@
 {
   "$schema": "https://gofastmcp.com/public/schemas/fastmcp.json/v1.json",
   "source": { "path": "server.py", "entrypoint": "mcp" },
-  "environment": { "dependencies": ["fastmcp", "httpx>=0.27"] },
+  "environment": {
+    "dependencies": [
+      "fastmcp",
+      "httpx>=0.27",
+      "pinecone>=5"
+    ]
+  },
   "deployment": {
     "transport": "http",
     "path": "/mcp/"
