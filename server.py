@@ -112,20 +112,10 @@ async def research_company_with_tavily(company_name: str, website_url: str, ctx:
 
 @mcp.tool(description="Search Pinecone text records within a user's namespace.")
 async def pinecone_search(UserId: str, query: str, top_k: int | None = None, ctx: Context | None = None) -> dict:
-    """
-    Inputs:
-      - UserId: per-user namespace (string)
-      - query: free-text query (string)
-      - top_k: optional int; defaults to 5
-
-    Returns:
-      - success: bool
-      - matches: list[str]              # text field(s) extracted from hits
-      - raw: full Pinecone response     # pass-through for inspection
-    """
     api_key = os.environ.get("PINECONE_API_KEY")
     index_name = os.environ.get("PINECONE_INDEX_NAME")
     index_host = os.environ.get("PINECONE_INDEX_HOST")  # optional
+
     if not api_key:
         raise ValueError("Missing PINECONE_API_KEY in environment.")
     if not index_name:
@@ -139,47 +129,57 @@ async def pinecone_search(UserId: str, query: str, top_k: int | None = None, ctx
     try:
         from pinecone import Pinecone
     except Exception as e:
-        raise RuntimeError("Pinecone SDK not available. Ensure 'pinecone' (v6/v7) is installed and redeploy.") from e
+        raise RuntimeError("Pinecone SDK not available. Ensure 'pinecone' is installed and redeploy.") from e
 
-    # fields you want back (must match what you've stored)
     fields = ['text', 'Tag', 'Type', 'RecordId', 'UserId', 'TimeStamp']
+    query_payload = {"inputs": {"text": query}, "top_k": k}
 
-    def _search_sync() -> Dict[str, Any]:
+    def _search_sync() -> Any:
         pc = Pinecone(api_key=api_key)
-        # v6/v7 Index constructor; host is optional if your SDK resolves it
         index = pc.Index(index_name, host=index_host) if index_host else pc.Index(index_name)
+        return index.search(namespace=UserId.strip(), query=query_payload, fields=fields)
 
-        # Records/text search on the INDEX (docs-preferred), namespaced via param
-        # NOTE: top_k must be snake_case in Python
-        result = index.search(
-            namespace=UserId.strip(),
-            query={"inputs": {"text": query}, "top_k": k},
-            fields=fields
-            # You can add rerank={...} here if desired
-        )
-        return result
-
+    # run blocking client off the loop
     try:
-        result = await asyncio.to_thread(_search_sync)
+        result_obj = await asyncio.to_thread(_search_sync)
     except Exception as e:
         return {"success": False, "error": "pinecone_search_failed", "message": str(e)}
 
-    # Normalize matches from result['result']['hits'][i]['fields']['text']
+    # ---- COERCE to plain dict to avoid Pydantic/serialization errors ----
+    def to_plain(o: Any) -> Any:
+        try:
+            if hasattr(o, "model_dump"):      # pydantic v2
+                return o.model_dump()
+            if hasattr(o, "dict"):            # pydantic v1
+                return o.dict()               # type: ignore[attr-defined]
+            if hasattr(o, "to_dict"):
+                return o.to_dict()            # type: ignore[attr-defined]
+        except Exception:
+            pass
+        if isinstance(o, (dict, list, str, int, float, bool)) or o is None:
+            return o
+        # last-resort: JSON round-trip with default serializer
+        return json.loads(json.dumps(o, default=lambda x: getattr(x, "__dict__", str(x))))
+
+    raw: Dict[str, Any] = to_plain(result_obj)
+
+    # ---- Extract matches from the coerced dict ----
     matches: List[str] = []
     try:
-        r = result if isinstance(result, dict) else getattr(result, "__dict__", {})
-        hits = (r.get("result", {}) or {}).get("hits", [])
+        hits = (raw.get("result", {}) or {}).get("hits", [])
         for h in hits:
-            f = h.get("fields", {})
+            f = h.get("fields", {}) or {}
             txt = f.get("text")
             if isinstance(txt, str):
                 matches.append(txt)
     except Exception:
+        # ignore parse issues; raw still returned
         pass
 
     if ctx:
-        await ctx.info(f"Pinecone Records: {len(matches)} matches (namespace={UserId.strip()}, top_k={k}).")
-    return {"success": True, "matches": matches, "raw": result}
+        await ctx.info(f"Pinecone: {len(matches)} matches (namespace={UserId.strip()}, top_k={k}).")
+
+    return {"success": True, "matches": matches, "raw": raw}
 
 
 # if __name__ == "__main__":
