@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Optional
 # PLATFORM_API_BASE = os.environ.get("PLATFORM_API_BASE", "https://api.mydomain.com")
 
 
-
-
 mcp = FastMCP(name="Personize", instructions="""
 Public remote MCP server for tools like research_company_with_tavily, memorizer and Recall.
 Supply Personize API key as a header: 
