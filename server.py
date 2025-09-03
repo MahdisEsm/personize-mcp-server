@@ -131,56 +131,76 @@ async def pinecone_search(UserId: str, query: str, top_k: int | None = None, ctx
     except Exception as e:
         raise RuntimeError("Pinecone SDK not available. Ensure 'pinecone' is installed and redeploy.") from e
 
-    fields = ['text', 'Tag', 'Type', 'RecordId', 'UserId', 'TimeStamp']
+    fields_wanted = ['text', 'Tag', 'Type', 'RecordId', 'UserId', 'TimeStamp']
     query_payload = {"inputs": {"text": query}, "top_k": k}
 
     def _search_sync() -> Any:
         pc = Pinecone(api_key=api_key)
         index = pc.Index(index_name, host=index_host) if index_host else pc.Index(index_name)
-        return index.search(namespace=UserId.strip(), query=query_payload, fields=fields)
+        return index.search(namespace=UserId.strip(), query=query_payload, fields=fields_wanted)
 
-    # run blocking client off the loop
     try:
         result_obj = await asyncio.to_thread(_search_sync)
     except Exception as e:
         return {"success": False, "error": "pinecone_search_failed", "message": str(e)}
 
-    # ---- COERCE to plain dict to avoid Pydantic/serialization errors ----
-    def to_plain(o: Any) -> Any:
-        try:
-            if hasattr(o, "model_dump"):      # pydantic v2
-                return o.model_dump()
-            if hasattr(o, "dict"):            # pydantic v1
-                return o.dict()               # type: ignore[attr-defined]
-            if hasattr(o, "to_dict"):
-                return o.to_dict()            # type: ignore[attr-defined]
-        except Exception:
-            pass
-        if isinstance(o, (dict, list, str, int, float, bool)) or o is None:
-            return o
-        # last-resort: JSON round-trip with default serializer
-        return json.loads(json.dumps(o, default=lambda x: getattr(x, "__dict__", str(x))))
-
-    raw: Dict[str, Any] = to_plain(result_obj)
-
-    # ---- Extract matches from the coerced dict ----
-    matches: List[str] = []
+    # ---------- Coerce to plain JSON safely ----------
+    # Prefer pydantic v2 json; fall back to dict() / best-effort
+    plain: Dict[str, Any] | None = None
     try:
-        hits = (raw.get("result", {}) or {}).get("hits", [])
-        for h in hits:
-            f = h.get("fields", {}) or {}
-            txt = f.get("text")
-            if isinstance(txt, str):
-                matches.append(txt)
+        if hasattr(result_obj, "model_dump_json"):
+            plain = json.loads(result_obj.model_dump_json())         # pydantic v2 safe JSON
+        elif hasattr(result_obj, "model_dump"):
+            plain = result_obj.model_dump(mode="json")               # pydantic v2 dict
+        elif hasattr(result_obj, "to_dict"):
+            plain = result_obj.to_dict()                             # some SDKs
+        elif hasattr(result_obj, "dict"):
+            plain = result_obj.dict()                                # pydantic v1
+        elif isinstance(result_obj, dict):
+            plain = result_obj
     except Exception:
-        # ignore parse issues; raw still returned
+        plain = None
+
+    # If still not plain (to avoid circular refs), build a minimal safe payload
+    if plain is None:
+        plain = {}
+
+    # ---------- Build safe, pruned payload ----------
+    # Expect shape like plain['result']['hits'][i]['fields']...
+    result_section = (plain.get("result", {}) if isinstance(plain, dict) else {}) or {}
+    hits = result_section.get("hits", []) if isinstance(result_section, dict) else []
+
+    matches: List[str] = []
+    safe_hits: List[Dict[str, Any]] = []
+    try:
+        for i, h in enumerate(hits):
+            # h is expected to be a dict
+            fields = h.get("fields", {}) if isinstance(h, dict) else {}
+            text_val = fields.get("text")
+            if isinstance(text_val, str):
+                matches.append(text_val)
+
+            # prune to JSON-safe subset (score + requested fields only)
+            safe_fields = {k: v for k, v in fields.items() if k in fields_wanted}
+            safe_hits.append({
+                "rank": i + 1,
+                "score": h.get("score"),
+                "fields": safe_fields
+            })
+    except Exception:
+        # if parsing fails, leave matches/safe_hits as-is
         pass
+
+    # Minimal raw that’s guaranteed JSON-safe (no circular refs)
+    safe_raw = {
+        "count": len(safe_hits),
+        "hits": safe_hits
+    }
 
     if ctx:
         await ctx.info(f"Pinecone: {len(matches)} matches (namespace={UserId.strip()}, top_k={k}).")
 
-    return {"success": True, "matches": matches, "raw": raw}
-
+    return {"success": True, "matches": matches, "raw": safe_raw}
 
 # if __name__ == "__main__":
 #     # For local testing only (remote hosting uses Cloud)
