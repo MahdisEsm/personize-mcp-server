@@ -109,10 +109,6 @@ async def research_company_with_tavily(company_name: str, website_url: str, ctx:
 
 
 # ---- Pinecone search tool ----
-@mcp.tool(description="Search Pinecone records for best text matches within a user's namespace.")
-import os, asyncio
-from typing import Any, Dict, List
-from fastmcp import Context
 
 @mcp.tool(description="Search Pinecone text records within a user's namespace.")
 async def pinecone_search(UserId: str, query: str, top_k: int | None = None, ctx: Context | None = None) -> dict:
