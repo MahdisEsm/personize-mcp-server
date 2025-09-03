@@ -110,11 +110,26 @@ async def research_company_with_tavily(company_name: str, website_url: str, ctx:
 
 # ---- Pinecone search tool ----
 @mcp.tool(description="Search Pinecone records for best text matches within a user's namespace.")
-async def pinecone_search(UserId: str, query: str, ctx: Context | None = None) -> dict:
+import os, asyncio
+from typing import Any, Dict, List
+from fastmcp import Context
+
+@mcp.tool(description="Search Pinecone text records within a user's namespace.")
+async def pinecone_search(UserId: str, query: str, top_k: int | None = None, ctx: Context | None = None) -> dict:
+    """
+    Inputs:
+      - UserId: per-user namespace (string)
+      - query: free-text query (string)
+      - top_k: optional int; defaults to 5
+
+    Returns:
+      - success: bool
+      - matches: list[str]              # text field(s) extracted from hits
+      - raw: full Pinecone response     # pass-through for inspection
+    """
     api_key = os.environ.get("PINECONE_API_KEY")
     index_name = os.environ.get("PINECONE_INDEX_NAME")
     index_host = os.environ.get("PINECONE_INDEX_HOST")  # optional
-
     if not api_key:
         raise ValueError("Missing PINECONE_API_KEY in environment.")
     if not index_name:
@@ -123,71 +138,52 @@ async def pinecone_search(UserId: str, query: str, ctx: Context | None = None) -
         raise ValueError("UserId is required.")
     if not query or not query.strip():
         raise ValueError("query is required.")
+    k = int(top_k or 5)
 
     try:
         from pinecone import Pinecone
     except Exception as e:
-        raise RuntimeError("Pinecone SDK not available. Ensure 'pinecone>=5' is installed.") from e
+        raise RuntimeError("Pinecone SDK not available. Ensure 'pinecone' (v6/v7) is installed and redeploy.") from e
+
+    # fields you want back (must match what you've stored)
+    fields = ['text', 'Tag', 'Type', 'RecordId', 'UserId', 'TimeStamp']
 
     def _search_sync() -> Dict[str, Any]:
         pc = Pinecone(api_key=api_key)
-        # Some SDKs expose pc.Index(...), others pc.index(...)
-        index = None
-        # try constructor first
-        try:
-            index = pc.Index(index_name, host=index_host) if index_host else pc.Index(index_name)
-        except TypeError:
-            pass
-        if index is None:
-            # fall back to function form if present
-            if hasattr(pc, "index"):
-                index = pc.index(index_name, host=index_host) if index_host else pc.index(index_name)
-            else:
-                raise RuntimeError("Could not construct Pinecone index; update the SDK.")
+        # v6/v7 Index constructor; host is optional if your SDK resolves it
+        index = pc.Index(index_name, host=index_host) if index_host else pc.Index(index_name)
 
-        # Prefer calling search on the index with namespace=...
-        if hasattr(index, "search_records"):
-            return index.search_records(
-                namespace=UserId.strip(),
-                query={"topK": 5, "inputs": {"text": query}},
-                fields=['text', 'Tag', 'Type', 'RecordId', 'UserId', 'TimeStamp'],
-            )
-        elif hasattr(index, "searchRecords"):
-            return index.searchRecords(  # type: ignore[attr-defined]
-                namespace=UserId.strip(),
-                query={"topK": 5, "inputs": {"text": query}},
-                fields=['text', 'Tag', 'Type', 'RecordId', 'UserId', 'TimeStamp'],
-            )
-        else:
-            raise RuntimeError(
-                "Index object has no 'search_records' method. "
-                "Your project may not have Records (text) search enabled, or the SDK is outdated."
-            )
+        # Records/text search on the INDEX (docs-preferred), namespaced via param
+        # NOTE: top_k must be snake_case in Python
+        result = index.search(
+            namespace=UserId.strip(),
+            query={"inputs": {"text": query}, "top_k": k},
+            fields=fields
+            # You can add rerank={...} here if desired
+        )
+        return result
 
     try:
         result = await asyncio.to_thread(_search_sync)
     except Exception as e:
         return {"success": False, "error": "pinecone_search_failed", "message": str(e)}
 
-    # Normalize a matches list from the response (best effort)
+    # Normalize matches from result['result']['hits'][i]['fields']['text']
     matches: List[str] = []
     try:
-        # common dict shape: result['result']['hits'][i]['fields']['text']
         r = result if isinstance(result, dict) else getattr(result, "__dict__", {})
         hits = (r.get("result", {}) or {}).get("hits", [])
         for h in hits:
-            fields = h.get("fields", {})
-            txt = fields.get("text")
+            f = h.get("fields", {})
+            txt = f.get("text")
             if isinstance(txt, str):
                 matches.append(txt)
     except Exception:
         pass
 
     if ctx:
-        await ctx.info(f"Pinecone records search returned {len(matches)} matches for namespace={UserId.strip()}.")
-
+        await ctx.info(f"Pinecone Records: {len(matches)} matches (namespace={UserId.strip()}, top_k={k}).")
     return {"success": True, "matches": matches, "raw": result}
-
 
 
 # if __name__ == "__main__":
