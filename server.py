@@ -110,22 +110,21 @@ async def research_company_with_tavily(company_name: str, website_url: str, ctx:
 
 # ---- Pinecone search tool ----
 
-@mcp.tool(description="Search Pinecone text records within a user's namespace.")
+@mcp.tool(description="Search Pinecone text records within a user's namespace (serverless host).")
 async def pinecone_search(UserId: str, query: str, top_k: int | None = None, ctx: Context | None = None) -> dict:
     api_key = os.environ.get("PINECONE_API_KEY")
-    index_name = os.environ.get("PINECONE_INDEX_NAME")
-    index_host = os.environ.get("PINECONE_INDEX_HOST")  # optional
-
+    index_host = os.environ.get("PINECONE_INDEX_HOST")  # REQUIRED for serverless targeting
     if not api_key:
         raise ValueError("Missing PINECONE_API_KEY in environment.")
-    if not index_name:
-        raise ValueError("Missing PINECONE_INDEX_NAME in environment.")
+    if not index_host:
+        raise ValueError("Missing PINECONE_INDEX_HOST in environment (use your serverless index host).")
     if not UserId or not UserId.strip():
         raise ValueError("UserId is required.")
     if not query or not query.strip():
         raise ValueError("query is required.")
     k = int(top_k or 5)
 
+    # SDK import at call time
     try:
         from pinecone import Pinecone
     except Exception as e:
@@ -136,71 +135,56 @@ async def pinecone_search(UserId: str, query: str, top_k: int | None = None, ctx
 
     def _search_sync() -> Any:
         pc = Pinecone(api_key=api_key)
-        index = pc.Index(index_name, host=index_host) if index_host else pc.Index(index_name)
-        return index.search(namespace=UserId.strip(), query=query_payload, fields=fields_wanted)
+
+        # IMPORTANT: target the index by HOST (matches Node.js behavior)
+        index = pc.Index(host=index_host)
+
+        # Records/text search — namespaced by parameter
+        result = index.search(
+            namespace=UserId.strip(),
+            query=query_payload,
+            fields=fields_wanted
+        )
+        return result
 
     try:
         result_obj = await asyncio.to_thread(_search_sync)
     except Exception as e:
         return {"success": False, "error": "pinecone_search_failed", "message": str(e)}
 
-    # ---------- Coerce to plain JSON safely ----------
-    # Prefer pydantic v2 json; fall back to dict() / best-effort
-    plain: Dict[str, Any] | None = None
+    # Coerce to plain JSON (avoid Pydantic cycles)
     try:
         if hasattr(result_obj, "model_dump_json"):
-            plain = json.loads(result_obj.model_dump_json())         # pydantic v2 safe JSON
+            plain = json.loads(result_obj.model_dump_json())
         elif hasattr(result_obj, "model_dump"):
-            plain = result_obj.model_dump(mode="json")               # pydantic v2 dict
+            plain = result_obj.model_dump(mode="json")
         elif hasattr(result_obj, "to_dict"):
-            plain = result_obj.to_dict()                             # some SDKs
+            plain = result_obj.to_dict()
         elif hasattr(result_obj, "dict"):
-            plain = result_obj.dict()                                # pydantic v1
+            plain = result_obj.dict()
         elif isinstance(result_obj, dict):
             plain = result_obj
+        else:
+            plain = {}
     except Exception:
-        plain = None
-
-    # If still not plain (to avoid circular refs), build a minimal safe payload
-    if plain is None:
         plain = {}
 
-    # ---------- Build safe, pruned payload ----------
-    # Expect shape like plain['result']['hits'][i]['fields']...
-    result_section = (plain.get("result", {}) if isinstance(plain, dict) else {}) or {}
-    hits = result_section.get("hits", []) if isinstance(result_section, dict) else []
-
+    # Extract hits safely
     matches: List[str] = []
     safe_hits: List[Dict[str, Any]] = []
-    try:
-        for i, h in enumerate(hits):
-            # h is expected to be a dict
-            fields = h.get("fields", {}) if isinstance(h, dict) else {}
-            text_val = fields.get("text")
-            if isinstance(text_val, str):
-                matches.append(text_val)
-
-            # prune to JSON-safe subset (score + requested fields only)
-            safe_fields = {k: v for k, v in fields.items() if k in fields_wanted}
-            safe_hits.append({
-                "rank": i + 1,
-                "score": h.get("score"),
-                "fields": safe_fields
-            })
-    except Exception:
-        # if parsing fails, leave matches/safe_hits as-is
-        pass
-
-    # Minimal raw that’s guaranteed JSON-safe (no circular refs)
-    safe_raw = {
-        "count": len(safe_hits),
-        "hits": safe_hits
-    }
+    hits = (plain.get("result", {}) or {}).get("hits", []) if isinstance(plain, dict) else []
+    for i, h in enumerate(hits):
+        fields = h.get("fields", {}) if isinstance(h, dict) else {}
+        txt = fields.get("text")
+        if isinstance(txt, str):
+            matches.append(txt)
+        safe_fields = {k: v for k, v in fields.items() if k in fields_wanted}
+        safe_hits.append({"rank": i + 1, "score": h.get("score"), "fields": safe_fields})
 
     if ctx:
-        await ctx.info(f"Pinecone: {len(matches)} matches (namespace={UserId.strip()}, top_k={k}).")
+        await ctx.info(f"Pinecone: {len(matches)} matches (namespace={UserId.strip()}, top_k={k}, host={index_host}).")
 
-    return {"success": True, "matches": matches, "raw": safe_raw}
+    return {"success": True, "matches": matches, "raw": {"count": len(safe_hits), "hits": safe_hits}}
 
 # if __name__ == "__main__":
 #     # For local testing only (remote hosting uses Cloud)
